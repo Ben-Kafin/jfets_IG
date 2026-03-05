@@ -184,7 +184,8 @@ class Circuit:
         f_base = self.freqs[0]
         dt = (1.0 / f_base) / samples_per_period
         self.dt = dt
-        t = np.arange(0, periods / f_base, dt)
+        total_samples = int(np.round((periods / f_base) / dt))
+        t = np.linspace(0, periods / f_base, total_samples, endpoint=False)
         self.t_len = len(t)
         v_in_array = np.zeros_like(t)
         for f in self.freqs: v_in_array += (amplitude / len(self.freqs)) * np.sin(2 * np.pi * f * t)
@@ -404,38 +405,30 @@ class CircuitAnalyzer:
 
     def export_audio(self, mode, target_duration_sec=4.0, target_sr=44100):
         print(f"--- Exporting Audio: {mode} Mode ---")
-        N_period = int((1.0 / 25.0) / self.circuit.dt)
-        N_overlap = int(0.1 * N_period)
-        start_idx = int((0.40 - (0.1 / 25.0)) / self.circuit.dt)
+        target_samples_per_period = int(np.round((1.0 / 25.0) * target_sr))
+        seamless_period_44k = resample(seamless_period, target_samples_per_period)
+        seamless_period_44k -= np.mean(seamless_period_44k)
         
-        v_out_steady_ext = self.v_out_data["OUT"][start_idx : start_idx + N_period + N_overlap]
-        
-        fade_in = np.linspace(0.0, 1.0, N_overlap, endpoint=False)
-        fade_out = np.linspace(1.0, 0.0, N_overlap, endpoint=False)
-        
-        head = v_out_steady_ext[:N_overlap]
-        tail = v_out_steady_ext[-N_overlap:]
-        blended_boundary = (head * fade_in) + (tail * fade_out)
-        
-        seamless_period = v_out_steady_ext[N_overlap : N_overlap + N_period].copy()
-        seamless_period[:N_overlap] = blended_boundary
-        
-        original_duration = N_period * self.circuit.dt
+        original_duration = 1.0 / 25.0
         tiles_needed = int(np.ceil(target_duration_sec / original_duration))
-        tiled_wave = np.tile(seamless_period, tiles_needed)
+        tiled_wave = np.tile(seamless_period_44k, tiles_needed + 1)
         
-        original_sr = 1.0 / self.circuit.dt
-        exact_samples = int(target_duration_sec * original_sr)
-        tiled_wave = tiled_wave[:exact_samples]
+        zero_crossings = np.where((tiled_wave[:-1] <= 0) & (tiled_wave[1:] > 0))[0]
+        exact_samples = int(np.round(target_duration_sec * target_sr))
         
-        target_samples = int(target_duration_sec * target_sr)
-        resampled_wave = resample(tiled_wave, target_samples)
+        zero_idx = zero_crossings[0]
+        integer_periods = int(np.floor(exact_samples / target_samples_per_period))
+        end_idx = zero_idx + (integer_periods * target_samples_per_period)
         
-        max_val = np.max(np.abs(resampled_wave))
+        sliced_wave = tiled_wave[zero_idx:end_idx].copy()
+        
+        max_val = np.max(np.abs(sliced_wave))
+        
+        max_val = np.max(np.abs(sliced_wave))
         if max_val > 0:
-            normalized_wave = resampled_wave / max_val
+            normalized_wave = sliced_wave / max_val
         else:
-            normalized_wave = resampled_wave
+            normalized_wave = sliced_wave
             
         pcm_wave = np.int16(normalized_wave * 32767)
         wavfile.write(f'mode_{mode}_audio.wav', target_sr, pcm_wave)
