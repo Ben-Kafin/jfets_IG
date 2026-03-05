@@ -405,6 +405,22 @@ class CircuitAnalyzer:
 
     def export_audio(self, mode, target_duration_sec=4.0, target_sr=44100):
         print(f"--- Exporting Audio: {mode} Mode ---")
+        N_period = int(np.round((1.0 / 25.0) / self.circuit.dt))
+        N_overlap = int(np.round(0.1 * N_period))
+        start_idx = int(np.round((0.40 - (0.1 / 25.0)) / self.circuit.dt))
+        
+        v_out_steady_ext = self.v_out_data["OUT"][start_idx : start_idx + N_period + N_overlap]
+        
+        fade_in = np.linspace(0.0, 1.0, N_overlap, endpoint=False)
+        fade_out = np.linspace(1.0, 0.0, N_overlap, endpoint=False)
+        
+        head = v_out_steady_ext[:N_overlap]
+        tail = v_out_steady_ext[-N_overlap:]
+        blended_boundary = (head * fade_in) + (tail * fade_out)
+        
+        seamless_period = v_out_steady_ext[0 : N_period].copy()
+        seamless_period[:N_overlap] = blended_boundary
+        
         target_samples_per_period = int(np.round((1.0 / 25.0) * target_sr))
         seamless_period_44k = resample(seamless_period, target_samples_per_period)
         seamless_period_44k -= np.mean(seamless_period_44k)
@@ -421,8 +437,6 @@ class CircuitAnalyzer:
         end_idx = zero_idx + (integer_periods * target_samples_per_period)
         
         sliced_wave = tiled_wave[zero_idx:end_idx].copy()
-        
-        max_val = np.max(np.abs(sliced_wave))
         
         max_val = np.max(np.abs(sliced_wave))
         if max_val > 0:
