@@ -32,7 +32,7 @@ if __name__ == "__main__":
 # --- Design Constants ---
 _INPUT_AMPLITUDE = 0.25
 _INPUT_VPA_EST   = 0.175
-_BLOCKING_FC_HZ  = 36.0
+_BLOCKING_FC_HZ  = 24.0
 _BLOCKING_T5_MS  = 36.0
 _BLOCKING_FC_FLOOR_HZ = 20.0
 _BLOCKING_T5_FLOOR_MS = 20.0
@@ -42,6 +42,22 @@ _R_BIAS       = 10e6      # DC bias for opamp +IN to V_REF
 _RG_OPAMP     = 1000.0    # Global feedback ground resistor (Rg)
 _OPAMP_V_MIN  = 0.25      # Output clamp low  (V- + 250mV)
 _OPAMP_V_MAX  = 17.75     # Output clamp high (V+ - 250mV) at VDD=18V
+
+# --- Coupling Cap Values ---
+# C1, C2: hardwired (R_g selected to match blocking window)
+_C1_VALUE     = 4.7e-9    # 4.7 nF — input coupling
+_C2_VALUE     = 4.7e-9    # 4.7 nF — interstage coupling
+# C4: output coupling (opamp → volume pot). Tune as needed.
+# 1× 4.7nF = 4.7nF (fc=67.7Hz — too high)
+# 2× 4.7nF = 9.4nF (fc=33.9Hz, 5τ=23.5ms)
+# 3× 4.7nF = 14.1nF (fc=22.6Hz, 5τ=35.2ms)
+_C4_VALUE     = 14.1e-9   # 3× 4.7nF parallel — adjust to taste
+
+# --- Clean Mode Cascade Gain Cap ---
+# Limits JFET cascade gain in Clean mode to reduce square-law asymmetry.
+# The opamp makes up the difference with perfectly linear gain.
+# Lower = cleaner but more opamp gain needed. 3-4× is the sweet spot.
+_CLEAN_MAX_CASCADE_GAIN = 1.0
 
 # ==========================================================================
 #  Numba-JIT Transient Solver Engine  (unchanged from jfets_claude_parallel)
@@ -351,10 +367,28 @@ class Circuit:
             return res * 1e3
         v0 = np.ones(dim) * (self.v_dd_ideal / 2.0)
         if "+" in self.node_map: v0[self.node_map["+"]] = self.v_dd_ideal
+        # IN: connected to v_ideal (0V) through L_PICKUP DCR (8kΩ)
+        if "IN" in self.node_map: v0[self.node_map["IN"]] = 0.0
+        # Gates biased through R_g to GND — must start near 0V
+        if "G1" in self.node_map: v0[self.node_map["G1"]] = 0.0
+        if "G2" in self.node_map: v0[self.node_map["G2"]] = 0.0
+        # Sources: self-bias ≈ |Vp|*(1-√α) ≈ 1V
+        if "S1" in self.node_map: v0[self.node_map["S1"]] = 1.0
+        if "S2" in self.node_map: v0[self.node_map["S2"]] = 1.0
+        # Drains: design-point Vd = |Vp| + km
         if "D1" in self.node_map: v0[self.node_map["D1"]] = self.v_dd_ideal * 0.75
-        if "D2" in self.node_map: v0[self.node_map["D2"]] = self.v_dd_ideal * 0.75
+        if "D2" in self.node_map: v0[self.node_map["D2"]] = self.v_dd_ideal * 0.5
+        # G3: biased to V_REF through R_bias
         if "G3" in self.node_map: v0[self.node_map["G3"]] = self.v_dd_ideal / 2.0
+        # OUT: DC-blocked from opamp, sits at 0V through R_vol to GND
+        if "OUT" in self.node_map: v0[self.node_map["OUT"]] = 0.0
         sol = least_squares(kcl_equations, v0, bounds=(-60.0, self.v_dd_ideal + 5.0), method='trf')
+        if sol.cost > 1e-6:
+            v0r = v0.copy()
+            if "G1" in self.node_map: v0r[self.node_map["G1"]] = 0.01
+            if "G2" in self.node_map: v0r[self.node_map["G2"]] = 0.01
+            sol2 = least_squares(kcl_equations, v0r, bounds=(-60.0, self.v_dd_ideal + 5.0), method='trf')
+            if sol2.cost < sol.cost: sol = sol2
         self.dc_op = {"-": 0.0, "V_FORCE": self.v_ctrl_force, "V_REF": self.v_dd_ideal / 2.0}
         for name, idx in self.node_map.items(): self.dc_op[name] = sol.x[idx]
         return self.dc_op
@@ -588,6 +622,11 @@ class CircuitAnalyzer:
         plt.suptitle(f"{mode} Mode: OPA1656 Output (G={opamp_gain:.2f}×)", fontweight='bold', fontsize=14)
         gs_ = gridspec.GridSpec(5, 2, figure=fig, width_ratios=[1, 1])
         si = int(np.round((10.0 * self.get_max_system_tau()) / self.circuit.dt))
+        # Align to positive-going zero crossing of input signal
+        v_in_ss = self.v_out_data["v_ideal"][si:]
+        zc = np.where((v_in_ss[:-1] <= 0) & (v_in_ss[1:] > 0))[0]
+        zc_offset = zc[0] if len(zc) > 0 else 0
+        si += zc_offset
         ts = self.t[si:]; tp = (ts - ts[0]) * 1000.0
         v_ref = self.circuit.v_dd_ideal / 2.0
         nodes = ["v_ideal", "G1", "D1", "D2", "G3"]
@@ -625,14 +664,36 @@ class CircuitAnalyzer:
         v_ref = self.circuit.v_dd_ideal / 2.0
         vg3 = self.v_out_data["G3"][si:]
         vop = np.clip(v_ref + opamp_gain * (vg3 - v_ref), _OPAMP_V_MIN, _OPAMP_V_MAX)
-        tsc = int(np.round(0.05 * target_sr)); c44 = resample(vop, tsc); c44 -= np.mean(c44)
-        N44 = int(np.round((1.0/25.0)*target_sr))
-        zc = np.where((c44[:-1]<=0)&(c44[1:]>0))[0]; sc = zc[zc>N44]
-        zs = sc[0] if len(sc)>0 else N44; dp = c44[zs:zs+N44].copy()
-        es = int(np.round(target_duration_sec*target_sr))
-        sw = np.tile(dp, int(np.ceil(es/len(dp))))[:es]
-        mx = np.max(np.abs(sw)); nw = (sw/mx) if mx>0 else sw
-        wavfile.write(f'mode_{mode}_audio.wav', target_sr, np.int16(nw*32767))
+        # Resample to 44.1kHz
+        tsc = int(np.round(0.05 * target_sr))
+        c44 = resample(vop, tsc)
+        c44 -= np.mean(c44)
+        # Extract one full common period (1/25s = 40ms) at a zero crossing
+        N44 = int(np.round((1.0 / 25.0) * target_sr))
+        zc = np.where((c44[:-1] <= 0) & (c44[1:] > 0))[0]
+        safe_zc = zc[zc > N44]
+        zs = safe_zc[0] if len(safe_zc) > 0 else N44
+        dp = c44[zs:zs + N44].copy()
+        # Crossfade tiling to eliminate clicks at splice boundaries
+        xfade = min(256, len(dp) // 4)
+        fade_in = np.linspace(0, 1, xfade)
+        fade_out = 1.0 - fade_in
+        exact_samples = int(np.round(target_duration_sec * target_sr))
+        out = np.zeros(exact_samples)
+        stride = len(dp) - xfade  # advance by this much each tile
+        pos = 0
+        while pos < exact_samples:
+            end = min(pos + len(dp), exact_samples)
+            chunk_len = end - pos
+            chunk = dp[:chunk_len].copy()
+            if pos > 0 and chunk_len >= xfade:
+                # Blend start of this tile with tail of previous
+                chunk[:xfade] = chunk[:xfade] * fade_in + out[pos:pos + xfade] * fade_out
+            out[pos:end] = chunk
+            pos += stride
+        mx = np.max(np.abs(out))
+        nw = (out / mx) if mx > 0 else out
+        wavfile.write(f'mode_{mode}_audio.wav', target_sr, np.int16(nw * 32767))
         print(f"--- Audio exported: mode_{mode}_audio.wav ---")
 
 
@@ -715,23 +776,28 @@ def _resolve_global_resistors(idss=0.0055, vp_abs=2.0, vdd=18.0,
     tau_ceiling = (target_recovery_ms / 1000.0) / 5.0
     e24_r = np.array(sorted(set(b*m for m in [1,10,100,1e3,1e4,1e5,1e6,1e7] for b in _E24_BASES)))
     r_vol = 500e3; r_bias = _R_BIAS; rg_opamp = _RG_OPAMP
-    # R_g
+    # R_g: iterate from LOWEST upward — lower R_g = less noise, less leakage sensitivity
     igss_max = 1e-9; r_g_max = 0.01 * vp_abs / igss_max; r_pickup_dcr = 8000.0
     r_g_calc = None
-    for rg in np.sort(e24_r[(e24_r >= 100e3) & (e24_r <= r_g_max)])[::-1]:
+    for rg in np.sort(e24_r[(e24_r >= 100e3) & (e24_r <= r_g_max)]):
         rth1 = float(rg) + r_pickup_dcr; rth2 = float(rg)
-        c1lo, c1hi = tau_floor/rth1, tau_ceiling/rth1; c2lo, c2hi = tau_floor/rth2, tau_ceiling/rth2
-        if np.any((_E24_CAPS >= c1lo-1e-15) & (_E24_CAPS <= c1hi+1e-15)) and np.any((_E24_CAPS >= c2lo-1e-15) & (_E24_CAPS <= c2hi+1e-15)):
+        tau_c1 = rth1 * _C1_VALUE; tau_c2 = rth2 * _C2_VALUE
+        if (tau_floor <= tau_c1 <= tau_ceiling) and (tau_floor <= tau_c2 <= tau_ceiling):
             r_g_calc = float(rg); break
-    if r_g_calc is None: r_g_calc = float(e24_r[(e24_r >= 100e3) & (e24_r <= r_g_max)][-1])
+    if r_g_calc is None:
+        r_g_calc = float(e24_r[(e24_r >= 100e3) & (e24_r <= r_g_max)][0])
+        print(f"  WARNING: No R_g puts C1={_C1_VALUE*1e9:.1f}nF/C2={_C2_VALUE*1e9:.1f}nF "
+              f"in blocking window. Using lowest: {r_g_calc/1e3:.0f}kΩ", flush=True)
     print(f"[GLOBAL] R_g: {r_g_calc/1e6:.2f} MΩ | R_vol: {r_vol/1e3:.0f} kΩ", flush=True)
-    # Rs / alpha
-    a1, a2 = 0.30, 0.25
+    print(f"[GLOBAL] C1={_C1_VALUE*1e9:.1f}nF C2={_C2_VALUE*1e9:.1f}nF C4={_C4_VALUE*1e9:.1f}nF (hardwired)", flush=True)
+    # Rs / alpha — higher alpha = more linear JFET transfer (less square-law asymmetry)
+    a1, a2 = 0.55, 0.55
     vs1, rs1, id1 = calc_self_bias(a1, idss, vp_abs)
     vs2, rs2, id2 = calc_self_bias(a2, idss, vp_abs)
     gm1 = 2*idss*np.sqrt(a1)/vp_abs; gm2 = 2*idss*np.sqrt(a2)/vp_abs
     re1 = 1/gm1; re2 = 1/gm2
-    # km sweep (no Q3 constraint)
+    # km sweep — cascade gain capped to reduce JFET nonlinearity in Clean mode
+    # (opamp makes up the difference with perfectly linear gain)
     best_km = None; best_s = -1.0
     for km1 in np.arange(vp_abs+0.5, vdd-vp_abs-1.0, 0.25):
         rd1t = (vdd-vp_abs-km1)/id1
@@ -741,17 +807,24 @@ def _resolve_global_resistors(idss=0.0055, vp_abs=2.0, vdd=18.0,
             rd2t = (vdd-vp_abs-km2)/id2
             if rd2t <= 0: continue
             g2 = rd2t/(rs2+re2)
-            if (_INPUT_AMPLITUDE*g1*g2) < (_INPUT_VPA_EST*3.0/0.9): continue
-            vd2q = vp_abs+km2; d2pk = _INPUT_AMPLITUDE*g1*g2; hr = min(vd2q, vdd-vd2q)
+            cascade = g1 * g2
+            # Minimum: D2 signal must be above noise floor (opamp provides makeup)
+            if cascade < 0.5: continue
+            if cascade > _CLEAN_MAX_CASCADE_GAIN: continue
+            vd2q = vp_abs+km2; d2pk = _INPUT_AMPLITUDE*cascade; hr = min(vd2q, vdd-vd2q)
             if d2pk > hr*0.99: continue
             sc = hr - d2pk
             if sc > best_s: best_s = sc; best_km = (km1, km2)
-    if best_km is None: best_km = (vdd/2-vp_abs, vdd/2-vp_abs)
+    if best_km is None:
+        best_km = (vdd/2-vp_abs, vdd/2-vp_abs)
+        print(f"  WARNING: No km pair satisfies cascade gain ∈ [0.5, {_CLEAN_MAX_CASCADE_GAIN}]. "
+              f"Using symmetric mid-rail.", flush=True)
     km_table = {"Clean": best_km, "OD1": (best_km[0], 0.5), "OD2": (0.5, 0.5)}
     per_mode_rd = {}
     for mode, (km1, km2) in km_table.items():
         per_mode_rd[mode] = ((vdd-vp_abs-km1)/id1, (vdd-vp_abs-km2)/id2)
-    print(f"[Clean km] km1={best_km[0]:.2f} km2={best_km[1]:.2f}", flush=True)
+    print(f"[Clean km] km1={best_km[0]:.2f} km2={best_km[1]:.2f} | "
+          f"cascade gain cap: {_CLEAN_MAX_CASCADE_GAIN:.1f}×", flush=True)
     for m, (rd1, rd2) in per_mode_rd.items(): print(f"[{m}] Rd1={rd1:.1f}Ω Rd2={rd2:.1f}Ω")
     print(f"[GLOBAL] OPA1656: R_bias={r_bias/1e6:.0f}MΩ Rg={rg_opamp:.0f}Ω swing={_OPAMP_V_MIN:.2f}–{_OPAMP_V_MAX:.2f}V")
     c_ref = 47e-6
@@ -791,22 +864,6 @@ def _probe_mode_rth(args):
     return {"mode":mode, "rth_c1":rth_c1, "rth_c2":rth_c2, "rth_c3":rth_c3}
 
 
-def _reconcile_global_caps(mode_rth_list, modes, tau_floor, tau_ceiling):
-    rth_by = {r["mode"]: r for r in mode_rth_list}; caps = {}
-    for cn, rk in [("C1","rth_c1"), ("C2","rth_c2")]:
-        rths = [rth_by[m][rk] for m in modes]
-        clo = max(tau_floor/r for r in rths); chi = min(tau_ceiling/r for r in rths)
-        cmid = (clo+chi)/2.0
-        if chi >= clo:
-            iw = _E24_CAPS[(_E24_CAPS >= clo-chi*1e-9) & (_E24_CAPS <= chi+chi*1e-9)]
-            best = float(iw[np.argmin(np.abs(iw - cmid))]) if len(iw) > 0 else float(_E24_CAPS[np.argmin(np.abs(_E24_CAPS - cmid))])
-        else:
-            best = float(_E24_CAPS[np.argmin(np.abs(_E24_CAPS - clo))])
-        caps[cn] = {"value": best}
-        print(f"[GLOBAL] {cn}: {best*1e9:.3f} nF | window: [{clo*1e9:.3f}, {chi*1e9:.3f}] nF", flush=True)
-    return caps
-
-
 def _find_e24_rf(gain_required, rg=_RG_OPAMP):
     rf_ideal = rg * (gain_required - 1.0)
     if rf_ideal <= 0: return 0.0, 1.0
@@ -840,16 +897,17 @@ def write_component_tsv(all_mode_components, global_resistors=None, filename="co
         f.write(f"GLOBAL\tR1/R4\tGate Bias\t{fR(gr.get('r_g_calc',10e6))}\t—\t—\t—\n")
         f.write(f"GLOBAL\tR_VOL\tVolume Pot\t{fR(gr.get('r_vol',500e3))}\t—\t—\t—\n")
         f.write(f"GLOBAL\tC_REF\tV_REF Bypass\t{fC(gr.get('c_ref',47e-6))}\t—\t—\t—\n")
-        f.write(f"GLOBAL\tL_PICKUP\tPickup\t4.5H (8kΩ DCR)\t—\t—\t—\n")
+        f.write("GLOBAL\tL_PICKUP\tPickup\t4.5H (8kΩ DCR)\t—\t—\t—\n")
         f.write(f"GLOBAL\tC1\tInput Coupling\t{fC(all_mode_components['Clean']['c1'])}\t—\t—\t—\n")
-        f.write(f"GLOBAL\tC2\tInterstage Coupling\t{fC(all_mode_components['Clean']['c2'])}\t—\t—\t—\n\n")
+        f.write(f"GLOBAL\tC2\tInterstage Coupling\t{fC(all_mode_components['Clean']['c2'])}\t—\t—\t—\n")
+        f.write(f"GLOBAL\tC4\tOutput Coupling (opamp→vol pot)\t{fC(all_mode_components['Clean'].get('c4', _C4_VALUE))}\t—\t—\t—\n\n")
         f.write(f"MODE_R\tR3\tQ1 Drain (base={fR(rd1b)})\t{fR(rd1b)}")
         for m in modes: f.write(f"\t{fR(all_mode_components[m]['rd1'])} / par={fR(parR(rd1b, all_mode_components[m]['rd1']))}")
         f.write("\n")
         f.write(f"MODE_R\tR6\tQ2 Drain (base={fR(rd2b)})\t{fR(rd2b)}")
         for m in modes: f.write(f"\t{fR(all_mode_components[m]['rd2'])} / par={fR(parR(rd2b, all_mode_components[m]['rd2']))}")
         f.write("\n\n")
-        f.write(f"OPAMP\tU1\tOPA1656 Dual Audio Op Amp\tSOIC-8, VDD=18V\t—\t—\t—\n")
+        f.write("OPAMP\tU1\tOPA1656 Dual Audio Op Amp\tSOIC-8, VDD=18V\t—\t—\t—\n")
         f.write(f"OPAMP\tR_BIAS\tOpamp +IN bias to V_REF\t{fR(gr.get('r_bias',_R_BIAS))}\t—\t—\t—\n")
         f.write(f"OPAMP\tRg\tFeedback ground R (global)\t{fR(gr.get('rg_opamp',_RG_OPAMP))}\t—\t—\t—\n")
         f.write("OPAMP\tC3\tD2→Opamp coupling (per-mode)\tper-mode")
@@ -889,10 +947,26 @@ if __name__ == "__main__":
     print("=" * 72)
     print(f"  JFET PREAMP + OPA1656 OUTPUT — {n_cpus} CPUs")
     print(f"  Blocking: tau ∈ [{tau_floor*1000:.2f}, {tau_ceiling*1000:.2f}] ms")
+    print(f"  Coupling caps: C1={_C1_VALUE*1e9:.1f}nF  C2={_C2_VALUE*1e9:.1f}nF  C4={_C4_VALUE*1e9:.1f}nF")
     print("=" * 72, flush=True)
 
-    # Phase A: Global resistors
+    # Phase A: Global resistors (R_g solver validates C1/C2 in blocking window)
     resistors = _resolve_global_resistors()
+
+    # Hardwired coupling caps
+    c1 = _C1_VALUE
+    c2 = _C2_VALUE
+    c4 = _C4_VALUE
+
+    # C4 blocking report (R_th ≈ R_vol since opamp output Z ≈ 0)
+    r_vol = resistors["r_vol"]
+    tau_c4 = r_vol * c4
+    fc_c4 = 1.0 / (2.0 * np.pi * tau_c4)
+    t5_c4 = 5.0 * tau_c4
+    c4_in_window = tau_floor <= tau_c4 <= tau_ceiling
+    print(f"[GLOBAL] C4: {c4*1e9:.1f} nF | R_th≈R_vol={r_vol/1e3:.0f}kΩ | "
+          f"fc={fc_c4:.1f}Hz | 5τ={t5_c4*1000:.1f}ms "
+          f"{'✓ in window' if c4_in_window else '(outside blocking window — DC stable, signal-only concern)'}")
 
     # Phase A2: Thevenin probes (single pass — no SCF needed)
     print("\n--- Thevenin Probes ---", flush=True)
@@ -900,25 +974,34 @@ if __name__ == "__main__":
         mode_rth_list = list(pool.map(_probe_mode_rth, [(m, resistors) for m in modes]))
     rth_by_mode = {r["mode"]: r for r in mode_rth_list}
 
-    # Phase A3: Global caps (C1, C2)
-    global_caps = _reconcile_global_caps(mode_rth_list, modes, tau_floor, tau_ceiling)
-    c1 = global_caps["C1"]["value"]; c2 = global_caps["C2"]["value"]
+    # Validate C1/C2 blocking in actual circuit
+    for m in modes:
+        rth = rth_by_mode[m]
+        for cn, cv, rk in [("C1", c1, "rth_c1"), ("C2", c2, "rth_c2")]:
+            tau = rth[rk] * cv
+            fc = 1.0 / (2.0 * np.pi * tau)
+            ok = tau_floor <= tau <= tau_ceiling
+            print(f"  [{m}/{cn}] R_th={rth[rk]/1000:.1f}kΩ × {cv*1e9:.1f}nF → "
+                  f"tau={tau*1000:.2f}ms fc={fc:.1f}Hz {'✓' if ok else '✗ OUT OF WINDOW'}")
 
-    # Per-mode C3 (biased to floor)
+    # Per-mode C3 (biased to floor of blocking window)
     c3_by_mode = {}
     for m in modes:
         rth_c3 = rth_by_mode[m]["rth_c3"]
         clo = tau_floor / rth_c3; chi = tau_ceiling / rth_c3
-        iw = _E24_CAPS[(_E24_CAPS >= clo-chi*1e-9) & (_E24_CAPS <= chi+chi*1e-9)]
+        eps = chi * 1e-9
+        iw = _E24_CAPS[(_E24_CAPS >= clo - eps) & (_E24_CAPS <= chi + eps)]
         c3_by_mode[m] = float(iw[0]) if len(iw) > 0 else float(_E24_CAPS[np.argmin(np.abs(_E24_CAPS - clo))])
-        print(f"[{m}] C3: {c3_by_mode[m]*1e9:.3f} nF | R_th: {rth_c3/1000:.1f}k")
+        tau_c3 = rth_c3 * c3_by_mode[m]
+        print(f"[{m}] C3: {c3_by_mode[m]*1e9:.3f} nF | R_th: {rth_c3/1000:.1f}k | "
+              f"tau={tau_c3*1000:.2f}ms fc={1/(2*np.pi*tau_c3):.1f}Hz")
 
     # Phase B: One transient per mode → analytical gain → E24 Rf
     print(f"\n{'='*72}\n  PHASE B — VPA + Opamp Gain (3 evals total)\n{'='*72}", flush=True)
-    mode_configs = {}; mode_gain = {}; mode_rf = {}
+    mode_configs = {}; mode_gain = {}; mode_rf = {}; mode_vpa_g3 = {}
     for m in modes:
         rd1, rd2 = resistors["per_mode_rd"][m]
-        cfg = {"mode":m, "c1":c1, "c2":c2, "c3":c3_by_mode[m],
+        cfg = {"mode":m, "c1":c1, "c2":c2, "c3":c3_by_mode[m], "c4":c4,
                "rd1":rd1, "rs1":resistors["rs1"], "rd2":rd2, "rs2":resistors["rs2"],
                "r_g_calc":resistors["r_g_calc"], "r_bias":resistors["r_bias"],
                "c_ref":resistors["c_ref"], "idss_t":resistors["idss_t"], "vp_t":resistors["vp_t"],
@@ -929,21 +1012,19 @@ if __name__ == "__main__":
         vpa_g3 = get_vpa_metric(ana.v_out_data["G3"], ana.circuit.dt, _CAL_FREQ)
         gain_req = _TARGET_VPA / vpa_g3 if vpa_g3 > 1e-6 else 1.0
         rf, g_actual = _find_e24_rf(gain_req)
-        mode_gain[m] = g_actual; mode_rf[m] = rf
-        print(f"[{m}] V_pa@G3={vpa_g3:.4f} | gain_req={gain_req:.3f}× → Rf={rf:.0f}Ω → G={g_actual:.3f}× → V_pa_out={vpa_g3*g_actual:.4f}")
+        mode_gain[m] = g_actual; mode_rf[m] = rf; mode_vpa_g3[m] = vpa_g3
+        print(f"[{m}] V_pa@G3={vpa_g3:.4f} | gain_req={gain_req:.3f}× → "
+              f"Rf={rf:.0f}Ω → G={g_actual:.3f}× → V_pa_out={vpa_g3*g_actual:.4f}")
 
-    spread = max(mode_gain[m] * get_vpa_metric(_eval_circuit_from_config(mode_configs[m]).v_out_data["G3"],
-                _eval_circuit_from_config(mode_configs[m]).circuit.dt, _CAL_FREQ) for m in modes) - \
-             min(mode_gain[m] * get_vpa_metric(_eval_circuit_from_config(mode_configs[m]).v_out_data["G3"],
-                _eval_circuit_from_config(mode_configs[m]).circuit.dt, _CAL_FREQ) for m in modes)
-    print(f"\n  Cross-mode VPA spread: {spread*1000:.2f} mV_w (E24 Rf rounding only)")
+    vpas_out = [mode_vpa_g3[m] * mode_gain[m] for m in modes]
+    print(f"\n  Cross-mode VPA spread: {(max(vpas_out)-min(vpas_out))*1000:.2f} mV_w")
 
     # Build BOM dict
     all_mode_components = {}
     for m in modes:
         rd1, rd2 = resistors["per_mode_rd"][m]
         all_mode_components[m] = {"rd1":rd1, "rs1":resistors["rs1"], "rd2":rd2, "rs2":resistors["rs2"],
-                                   "c1":c1, "c2":c2, "c3":c3_by_mode[m],
+                                   "c1":c1, "c2":c2, "c3":c3_by_mode[m], "c4":c4,
                                    "rf_opamp":mode_rf[m], "opamp_gain":mode_gain[m]}
 
     # Phase D: Full analytics
