@@ -1405,17 +1405,19 @@ class CircuitAnalyzer:
     def run_transient(self):
         f_base = self.freqs[0]
         sys_tau = self.get_max_system_tau()
-        # Physics-Driven Timing: 10-Tau Settlement + 20-Period Measurement Window
-        t_settle = 10.0 * sys_tau
-        t_meas = 20.0 / f_base
-        total_sec = t_settle + t_meas
-        
-        integer_periods = int(np.round(total_sec * f_base))
+        # Settle for 20× the slowest system tau (rounded up to whole periods)
+        # plus a 20-period measurement window.
+        settle_periods = int(np.ceil(20.0 * sys_tau * f_base))
+        meas_periods = 20
+        integer_periods = settle_periods + meas_periods
         self.t, self.v_in, self.v_out_data = self.circuit.solve_transient(
             input_node=self.input_node, monitor_nodes=self.monitor_nodes, 
             freqs=self.freqs, amplitude=self.amplitude,
             periods=integer_periods, samples_per_period=2048
         )
+        # Save the multi-tone dt — single-tone THD runs will overwrite
+        # self.circuit.dt, but plotting needs the original value.
+        self.dt = self.circuit.dt
 
     def report_ac_analytics(self):
         print("\n--- Capacitor Thevenin Analytics ---")
@@ -1541,13 +1543,13 @@ class CircuitAnalyzer:
         ax_fft = fig.add_subplot(gs[:, 1])
 
         # FFT always on steady-state data (skip 10τ) regardless of plot window
-        fft_start_idx = int(np.round((10.0 * sys_tau) / self.circuit.dt))
+        fft_start_idx = int(np.round((10.0 * sys_tau) / self.dt))
         v_out_raw = self.v_out_data["OUT"][fft_start_idx:]
         v_out_ac = v_out_raw - np.mean(v_out_raw)
 
         N = len(v_out_ac)
         Y = np.fft.rfft(v_out_ac * np.hanning(N))
-        xf = np.fft.rfftfreq(N, d=self.circuit.dt)
+        xf = np.fft.rfftfreq(N, d=self.dt)
         mag = (2.0/N * np.abs(Y)) + 1e-12 
 
         weighted_mag = mag * _a_weight(xf)
@@ -1583,15 +1585,23 @@ class CircuitAnalyzer:
         """
         Plot signal chain waveforms and harmonic spectrum.
 
-        Non-bloom modes: one plot — steady-state extract (~40ms)
+        Non-bloom modes: one plot — steady-state extract (one true period)
         Bloom modes:     two plots — bloom recovery transient + steady-state
         """
+        from math import gcd
+        from functools import reduce
+
         bloom_active = mode_def.get('bloom', False) if mode_def else False
         sys_tau = self.get_max_system_tau()
-        ss_start_idx = int(np.round((10.0 * sys_tau) / self.circuit.dt))
+        ss_start_idx = int(np.round((10.0 * sys_tau) / self.dt))
+
+        # Compute true period from input frequencies
+        freq_ints = [max(1, int(round(f))) for f in self.freqs]
+        f_repeat = reduce(gcd, freq_ints)
+        true_period_ms = 1000.0 / f_repeat
 
         # Plot 1 (all modes): steady-state
-        self._render_plot(mode, ss_start_idx, window_ms=40.0,
+        self._render_plot(mode, ss_start_idx, window_ms=true_period_ms,
                           title_suffix="Steady State Extract",
                           filename=f'mode_{mode}_analysis.png',
                           subtract_dc=True)
@@ -1687,9 +1697,9 @@ class CircuitAnalyzer:
         from functools import reduce
 
         print(f"--- Exporting Audio: {mode} Mode ---")
-        start_idx = int(np.round((10.0 * self.get_max_system_tau()) / self.circuit.dt))
+        start_idx = int(np.round((10.0 * self.get_max_system_tau()) / self.dt))
         # Guard: ensure at least 2 periods of data remain after settling skip
-        min_samples = int(np.round(2.0 / self.freqs[0] / self.circuit.dt))
+        min_samples = int(np.round(2.0 / self.freqs[0] / self.dt))
         if start_idx > len(self.v_out_data["OUT"]) - min_samples:
             start_idx = max(0, len(self.v_out_data["OUT"]) - min_samples)
         v_ss = self.v_out_data["OUT"][start_idx:].copy()
@@ -1699,7 +1709,7 @@ class CircuitAnalyzer:
         freq_ints = [max(1, int(round(f))) for f in self.freqs]
         f_repeat = reduce(gcd, freq_ints)
         true_period_sec = 1.0 / f_repeat
-        period_samples_sim = int(np.round(true_period_sec / self.circuit.dt))
+        period_samples_sim = int(np.round(true_period_sec / self.dt))
 
         print(f"  Input freqs GCD = {f_repeat} Hz → true period = {true_period_sec*1000:.2f} ms")
 
@@ -1707,7 +1717,7 @@ class CircuitAnalyzer:
 
         # The extract includes a ~15% overlap extension past the second ZC.
         # Resample the whole extended segment to 44.1 kHz, then fold-and-crossfade.
-        actual_period_sec = len(one_period_ext_sim) * self.circuit.dt
+        actual_period_sec = len(one_period_ext_sim) * self.dt
         ext_samples_44k = max(1, int(np.round(actual_period_sec * target_sr)))
         ext_44k = resample(one_period_ext_sim, ext_samples_44k)
         ext_44k -= np.mean(ext_44k)  # Remove any DC from resampling
@@ -1951,7 +1961,7 @@ class CircuitAnalyzer:
         f_repeat = reduce(gcd, freq_ints)
         true_period_sec = 1.0 / f_repeat
 
-        dt_sim = self.circuit.dt
+        dt_sim = self.dt
         period_samples_sim = int(np.round(true_period_sec / dt_sim))
 
         # --- Pre-attack steady-state period (from main transient) ---
@@ -2315,7 +2325,7 @@ def _eval_cap_worker(args):
 def _resolve_global_resistors(idss, vp_abs, vdd,
                                target_fc_hz, target_recovery_ms,
                                mode_table, volume_ratio,
-                               jfet_model=None):
+                               jfet_model=None, cap_overrides=None):
     """
     Compute ALL global resistors from LSK489 datasheet + blocking constraints.
 
@@ -2379,11 +2389,24 @@ def _resolve_global_resistors(idss, vp_abs, vdd,
     for rg in r_g_candidates:
         rth_c1_est = float(rg) + r_pickup_dcr
         rth_c2_est = float(rg)
-        c1_min, c1_max = tau_floor / rth_c1_est, tau_ceiling / rth_c1_est
-        c2_min, c2_max = tau_floor / rth_c2_est, tau_ceiling / rth_c2_est
-        eps = 1e-15
-        has_c1 = bool(np.any((_E24_CAPS >= c1_min - eps) & (_E24_CAPS <= c1_max + eps)))
-        has_c2 = bool(np.any((_E24_CAPS >= c2_min - eps) & (_E24_CAPS <= c2_max + eps)))
+        # If caps are locked, check whether the locked value fits blocking
+        # for this R_g.  Otherwise, search for an E24 cap in the window.
+        if cap_overrides and "C1" in cap_overrides:
+            c1_locked = cap_overrides["C1"]
+            tau_c1 = rth_c1_est * c1_locked
+            has_c1 = tau_floor <= tau_c1 <= tau_ceiling
+        else:
+            c1_min, c1_max = tau_floor / rth_c1_est, tau_ceiling / rth_c1_est
+            eps = 1e-15
+            has_c1 = bool(np.any((_E24_CAPS >= c1_min - eps) & (_E24_CAPS <= c1_max + eps)))
+        if cap_overrides and "C2" in cap_overrides:
+            c2_locked = cap_overrides["C2"]
+            tau_c2 = rth_c2_est * c2_locked
+            has_c2 = tau_floor <= tau_c2 <= tau_ceiling
+        else:
+            c2_min, c2_max = tau_floor / rth_c2_est, tau_ceiling / rth_c2_est
+            eps = 1e-15
+            has_c2 = bool(np.any((_E24_CAPS >= c2_min - eps) & (_E24_CAPS <= c2_max + eps)))
         if has_c1 and has_c2:
             r_g_calc = float(rg)
             break
@@ -2967,10 +2990,14 @@ def _probe_mode_rth(args):
 
 
 def _reconcile_global_caps(mode_rth_list, modes, tau_floor, tau_ceiling,
-                           sec_fc_floor, sec_t5_floor):
+                           sec_fc_floor, sec_t5_floor, cap_overrides=None):
     """
     For each coupling cap, find the single GLOBAL E24 value that satisfies
     the blocking window across ALL modes' R_th values.
+
+    cap_overrides: optional dict, e.g. {"C1": 4.7e-9, "C2": 4.7e-9}.
+        Locked caps skip the reconciliation solver entirely.  R_g is then
+        chosen to give the desired tau with the locked cap value.
 
     Dual-threshold enforcement:
       Primary bounds:
@@ -3038,12 +3065,35 @@ def _reconcile_global_caps(mode_rth_list, modes, tau_floor, tau_ceiling,
         return scored[0][0]
 
     # --- C1, C2: both-bound intersection, single E24 only ---
+    if cap_overrides is None:
+        cap_overrides = {}
     for cname, rth_key in [("C1","rth_c1"), ("C2","rth_c2")]:
         rth_values = [rth_by_mode[m][rth_key] for m in modes]
         c_min = max(tau_eff_floor   / rth for rth in rth_values)
         c_max = min(tau_eff_ceiling / rth for rth in rth_values)
         c_mid = (c_min + c_max) / 2.0
         rth_strs = ", ".join(f"{m}:{rth_by_mode[m][rth_key]/1000:.1f}k" for m in modes)
+
+        # --- User override: lock this cap to a specific value ---
+        if cname in cap_overrides:
+            locked_val = float(cap_overrides[cname])
+            info = {"value": locked_val, "is_combo": False, "base": locked_val, "delta": None}
+            # Report blocking status with locked value
+            taus = [rth * locked_val for rth in rth_values]
+            fcs  = [1.0/(2*np.pi*t) for t in taus]
+            t5s  = [5*t for t in taus]
+            fc_ok = all(f >= sec_fc_floor for f in fcs)
+            t5_ok = all(t >= sec_t5_floor for t in t5s)
+            status = "✓" if (fc_ok and t5_ok) else "⚠ OUTSIDE BLOCKING WINDOW"
+            print(f"[GLOBAL] {cname}: {locked_val*1e9:.3f} nF [LOCKED] {status} | "
+                  f"window: [{c_min*1e9:.3f}, {c_max*1e9:.3f}] nF | R_th: {rth_strs}",
+                  flush=True)
+            if not (fc_ok and t5_ok):
+                print(f"  NOTE: Locked {cname}={locked_val*1e9:.1f}nF is outside the blocking window. "
+                      f"R_g may need adjustment to restore blocking compliance.",
+                      flush=True)
+            caps[cname] = info
+            continue
 
         if c_max >= c_min:
             eps = c_max * 1e-9
@@ -3350,13 +3400,13 @@ def execute_mode_analytics(mode, c3_shunt_target, rtot_target, config, mode_def=
     analyzer.run_transient()
 
     # Sync: Use the same physics-driven index for gain/Vpp calculations
-    start_idx = int(np.round((10.0 * analyzer.get_max_system_tau()) / analyzer.circuit.dt))
+    start_idx = int(np.round((10.0 * analyzer.get_max_system_tau()) / analyzer.dt))
     v_ideal_ss = analyzer.v_out_data["v_ideal"][start_idx:]
     out_ss     = analyzer.v_out_data["OUT"][start_idx:]
     vpp_ref    = np.max(v_ideal_ss) - np.min(v_ideal_ss)
     vpp_out    = np.max(out_ss)     - np.min(out_ss)
 
-    vpa_final = get_vpa_metric(analyzer.v_out_data["OUT"], analyzer.circuit.dt, analyzer.freqs)
+    vpa_final = get_vpa_metric(analyzer.v_out_data["OUT"], analyzer.dt, analyzer.freqs)
     print(f"\n[{mode} MODE] Cascade Acoustic Summary (STEADY-STATE):")
     print(f"  Vpp In: {vpp_ref:.4f} V")
     print(f"  Vpp Post-C4: {vpp_out:.4f} V")
@@ -3392,7 +3442,7 @@ def execute_mode_analytics(mode, c3_shunt_target, rtot_target, config, mode_def=
 
 
 def run_preamp_design(idss, vp_abs, vdd, modes, volume_ratio,
-                       blocking, bloom_light, bloom_heavy):
+                       blocking, bloom_light, bloom_heavy, cap_overrides=None):
     """
     Full preamp design pipeline: validation, component resolution,
     VPA optimization, and analytics.
@@ -3406,6 +3456,8 @@ def run_preamp_design(idss, vp_abs, vdd, modes, volume_ratio,
         blocking:      dict with fc_hz, t5_ms, fc_floor_hz, t5_floor_ms
         bloom_light:   dict with fc_hz, t5_ms, fc_floor_hz, t5_floor_ms
         bloom_heavy:   dict with fc_hz, t5_ms, fc_floor_hz, t5_floor_ms
+        cap_overrides: optional dict, e.g. {"C1": 4.7e-9, "C2": 4.7e-9}
+                       Locked caps bypass the reconciliation solver.
     """
     # ==================================================================
     #  VALIDATION — Check all inputs before computation
@@ -3465,6 +3517,7 @@ def run_preamp_design(idss, vp_abs, vdd, modes, volume_ratio,
         idss=idss, vp_abs=vp_abs, vdd=vdd,
         target_fc_hz=blocking['fc_hz'], target_recovery_ms=blocking['t5_ms'],
         mode_table=modes, volume_ratio=volume_ratio, jfet_model=jfet_model,
+        cap_overrides=cap_overrides,
     )
 
     # ==================================================================
@@ -3531,7 +3584,8 @@ def run_preamp_design(idss, vp_abs, vdd, modes, volume_ratio,
         global_caps = _reconcile_global_caps(mode_rth_list, mode_names,
                                               tau_floor, tau_ceiling,
                                               sec_fc_floor=blocking['fc_floor_hz'],
-                                              sec_t5_floor=blocking['t5_floor_ms'] / 1000.0)
+                                              sec_t5_floor=blocking['t5_floor_ms'] / 1000.0,
+                                              cap_overrides=cap_overrides)
 
         # Phase A4: Config assembly
         c1 = global_caps["C1"]["value"]
@@ -3879,6 +3933,16 @@ if __name__ == "__main__":
     # All modes are matched to this same ratio via the G3 shunt network.
     VOLUME_RATIO = 3
 
+    # --- Cap Overrides (optional) ---
+    # Lock specific coupling caps to fixed values, bypassing the solver.
+    # The solver will choose R_g to compensate.  Comment out or set to {}
+    # to let the solver pick all cap values automatically.
+    CAP_OVERRIDES = {
+        "C1": 4.7e-9,   # 4.7 nF — allows lower R_g for less gate offset
+        "C2": 4.7e-9,   # 4.7 nF
+    }
+
     # --- Run ---
     run_preamp_design(IDSS, VP_ABS, VDD, MODES, VOLUME_RATIO,
-                       blocking, bloom_light, bloom_heavy)
+                       blocking, bloom_light, bloom_heavy,
+                       cap_overrides=CAP_OVERRIDES)
